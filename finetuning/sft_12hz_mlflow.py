@@ -21,16 +21,54 @@ from huggingface_hub import snapshot_download
 
 import torch
 import mlflow
-import mlflow.pytorch
+import soundfile as sf
 from accelerate import Accelerator
 from dataset import TTSDataset
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from safetensors.torch import save_file
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+
+# S3/MinIO configuration for MLflow artifacts
+os.environ["MLFLOW_S3_ENDPOINT_URL"] = "http://localhost:9002"
+os.environ["AWS_ACCESS_KEY_ID"] = "minioadmin"
+os.environ["AWS_SECRET_ACCESS_KEY"] = "homelab-minio-2026"
+os.environ["MLFLOW_S3_IGNORE_TLS"] = "true"
+
 from transformers import AutoConfig
 
 target_speaker_embedding = None
+
+def inference_sample(checkpoint_path, speaker_name, epoch, output_dir, text="Xin chào, tôi là trợ lý ảo."):
+    """Generate sample audio and save to checkpoint directory."""
+    accelerator = Accelerator()
+    if accelerator.is_main_process:
+        try:
+            accelerator.print(f"Generating sample for epoch {epoch}...")
+            tts = Qwen3TTSModel.from_pretrained(
+                checkpoint_path,
+                device_map="cuda:0",
+                torch_dtype=torch.bfloat16,
+            )
+            wavs, sr = tts.generate_custom_voice(text=text, speaker=speaker_name)
+            
+            # Save to checkpoint directory
+            audio_path = os.path.join(output_dir, f"sample_epoch_{epoch}.wav")
+            sf.write(audio_path, wavs[0], sr)
+            
+            # Log to MLflow artifacts (now with S3/MinIO)
+            try:
+                mlflow.log_artifact(audio_path, artifact_path="audio_samples")
+                accelerator.print(f"Logged audio sample to MLflow: {audio_path}")
+            except Exception as upload_err:
+                accelerator.print(f"MLflow upload failed (saved locally): {upload_err}")
+            
+            # Clean up
+            del tts
+            torch.cuda.empty_cache()
+        except Exception as e:
+            accelerator.print(f"Error generating sample for epoch {epoch}: {e}")
+
 def train():
     global target_speaker_embedding
 
@@ -47,18 +85,19 @@ def train():
     accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
 
     # MLflow setup
-    mlflow.set_tracking_uri("http://localhost:30500")
-    mlflow.set_experiment("qwen3-tts-finetuning")
-    mlflow.start_run(run_name=f"betterversion_{args.speaker_name}")
-    mlflow.log_params({
-        "model": args.init_model_path,
-        "batch_size": args.batch_size,
-        "learning_rate": args.lr,
-        "num_epochs": args.num_epochs,
-        "speaker_name": args.speaker_name,
-        "gradient_accumulation_steps": 4,
-        "mixed_precision": "bf16",
-    })
+    if accelerator.is_main_process:
+        mlflow.set_tracking_uri("http://localhost:30500")
+        mlflow.set_experiment("qwen3-tts-finetuning")
+        mlflow.start_run(run_name=f"1.7b_{args.speaker_name}_100ep")
+        mlflow.log_params({
+            "model": args.init_model_path,
+            "batch_size": args.batch_size,
+            "learning_rate": args.lr,
+            "num_epochs": args.num_epochs,
+            "speaker_name": args.speaker_name,
+            "gradient_accumulation_steps": 4,
+            "mixed_precision": "bf16",
+        })
 
     MODEL_PATH = args.init_model_path
 
@@ -82,6 +121,7 @@ def train():
 
     num_epochs = args.num_epochs
     model.train()
+    global_step = 0
 
     for epoch in range(num_epochs):
         for step, batch in enumerate(train_dataloader):
@@ -143,17 +183,16 @@ def train():
                     mlflow.log_metrics({
                         "loss": loss.item(),
                         "epoch": epoch,
-                    }, step=epoch * len(train_dataloader) + step)
+                    }, step=global_step)
+            
+            global_step += 1
 
         if accelerator.is_main_process:
             output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch}")
-            # Get local path from HuggingFace cache
             local_model_path = snapshot_download(MODEL_PATH)
             shutil.copytree(local_model_path, output_dir, dirs_exist_ok=True)
 
             input_config_file = os.path.join(local_model_path, "config.json")
-            # mlflow.log_artifact(output_dir)  # Skip S3 upload, checkpoint saved locally
-            mlflow.log_metric("checkpoint_epoch", epoch)
             output_config_file = os.path.join(output_dir, "config.json")
             with open(input_config_file, 'r', encoding='utf-8') as f:
                 config_dict = json.load(f)
@@ -183,7 +222,14 @@ def train():
             save_path = os.path.join(output_dir, "model.safetensors")
             save_file(state_dict, save_path)
 
-    # End MLflow run
+            # Log checkpoint epoch
+            mlflow.log_metric("checkpoint_epoch", epoch, step=global_step)
+            
+            # Generate and log sample audio
+            inference_sample(output_dir, args.speaker_name, epoch, args.output_model_path)
+            
+            accelerator.print(f"Checkpoint saved: {output_dir}")
+
     if accelerator.is_main_process:
         mlflow.end_run()
 

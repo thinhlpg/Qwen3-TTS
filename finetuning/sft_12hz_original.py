@@ -20,8 +20,6 @@ import shutil
 from huggingface_hub import snapshot_download
 
 import torch
-import mlflow
-import mlflow.pytorch
 from accelerate import Accelerator
 from dataset import TTSDataset
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
@@ -45,20 +43,6 @@ def train():
     args = parser.parse_args()
 
     accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
-
-    # MLflow setup
-    mlflow.set_tracking_uri("http://localhost:30500")
-    mlflow.set_experiment("qwen3-tts-finetuning")
-    mlflow.start_run(run_name=f"betterversion_{args.speaker_name}")
-    mlflow.log_params({
-        "model": args.init_model_path,
-        "batch_size": args.batch_size,
-        "learning_rate": args.lr,
-        "num_epochs": args.num_epochs,
-        "speaker_name": args.speaker_name,
-        "gradient_accumulation_steps": 4,
-        "mixed_precision": "bf16",
-    })
 
     MODEL_PATH = args.init_model_path
 
@@ -139,21 +123,13 @@ def train():
 
             if step % 10 == 0:
                 accelerator.print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f}")
-                if accelerator.is_main_process:
-                    mlflow.log_metrics({
-                        "loss": loss.item(),
-                        "epoch": epoch,
-                    }, step=epoch * len(train_dataloader) + step)
 
         if accelerator.is_main_process:
             output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch}")
-            # Get local path from HuggingFace cache
             local_model_path = snapshot_download(MODEL_PATH)
             shutil.copytree(local_model_path, output_dir, dirs_exist_ok=True)
 
             input_config_file = os.path.join(local_model_path, "config.json")
-            # mlflow.log_artifact(output_dir)  # Skip S3 upload, checkpoint saved locally
-            mlflow.log_metric("checkpoint_epoch", epoch)
             output_config_file = os.path.join(output_dir, "config.json")
             with open(input_config_file, 'r', encoding='utf-8') as f:
                 config_dict = json.load(f)
@@ -182,10 +158,6 @@ def train():
             state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
             save_path = os.path.join(output_dir, "model.safetensors")
             save_file(state_dict, save_path)
-
-    # End MLflow run
-    if accelerator.is_main_process:
-        mlflow.end_run()
 
 if __name__ == "__main__":
     train()
